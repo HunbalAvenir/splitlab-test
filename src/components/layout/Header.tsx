@@ -5,7 +5,6 @@ interface HeaderProps {
   subtitle?: string;
   actions?: React.ReactNode;
 }
-
 export default function Header({ title, subtitle, actions }: HeaderProps) {
   return (
     <div className="h-16 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between px-6 bg-white/50 dark:bg-slate-900/50 backdrop-blur-sm sticky top-0 z-10">
