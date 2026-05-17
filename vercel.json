@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "framework": "nextjs",
+  "regions": ["iad1"],
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "has": [
+        {
+          "type": "host",
+          "value": "(?<host>.*)"
+        }
+      ],
+      "destination": "/$1"
+    }
+  ]
+}

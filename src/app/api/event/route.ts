@@ -1,0 +1,86 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/supabase-server';
+import { z } from 'zod';
+
+function corsHeaders(request: NextRequest) {
+  const origin = request.headers.get('origin') || '*';
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  };
+}
+
+const schema = z.object({
+  testId: z.string().uuid(),
+  variantId: z.string().uuid(),
+  goalId: z.string().uuid().nullable().optional(),
+  visitorHash: z.string().min(1).max(64),
+  type: z.enum(['pageview', 'conversion']),
+  metadata: z.record(z.unknown()).nullable().optional(),
+});
+
+export async function POST(request: NextRequest) {
+  const headers = corsHeaders(request);
+  try {
+    const body = await request.json();
+    const data = schema.parse(body);
+
+    // Deduplicate pageviews: one pageview per visitor per test per day
+    if (data.type === 'pageview') {
+      const today = new Date().toISOString().slice(0, 10);
+      const { data: existing } = await db
+        .from('events')
+        .select('id')
+        .eq('test_id', data.testId)
+        .eq('variant_id', data.variantId)
+        .eq('visitor_hash', data.visitorHash)
+        .eq('type', 'pageview')
+        .gte('created_at', `${today}T00:00:00Z`)
+        .limit(1)
+        .single();
+
+      if (existing) {
+        return NextResponse.json({ ok: true, duplicate: true }, { headers });
+      }
+    }
+
+    // Auto-match goal_id from metadata.trigger when not explicitly provided
+    let goalId = data.goalId || null;
+    if (data.type === 'conversion' && !goalId && data.metadata?.trigger) {
+      const { data: goals } = await db
+        .from('conversion_goals')
+        .select('id, type')
+        .eq('test_id', data.testId)
+        .eq('type', data.metadata.trigger as string);
+
+      if (goals && goals.length > 0) {
+        goalId = goals[0].id;
+      }
+    }
+
+    const { error } = await db.from('events').insert({
+      test_id: data.testId,
+      variant_id: data.variantId,
+      goal_id: goalId,
+      visitor_hash: data.visitorHash,
+      type: data.type,
+      metadata: data.metadata || {},
+    });
+
+    if (error) throw error;
+
+    return NextResponse.json({ ok: true }, { headers });
+  } catch (err) {
+    if (err instanceof z.ZodError) {
+      return NextResponse.json({ error: err.errors }, { status: 400, headers });
+    }
+    console.error('[event]', err);
+    return NextResponse.json({ error: 'Internal error' }, { status: 500, headers });
+  }
+}
+
+export async function OPTIONS(request: NextRequest) {
+  return new NextResponse(null, { headers: corsHeaders(request) });
+}

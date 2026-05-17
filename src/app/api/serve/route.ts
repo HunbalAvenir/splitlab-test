@@ -1,0 +1,367 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/supabase-server';
+import { downloadHtml } from '@/lib/storage';
+import { buildTrackingSnippet, injectIntoHtml, buildScriptTag } from '@/lib/tracking';
+import { assignVariant } from '@/lib/utils';
+
+const APP_URL = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+const COOKIE_NAME = 'sl_visitor';
+
+export async function GET(request: NextRequest) {
+  const { searchParams } = new URL(request.url);
+  const domain = searchParams.get('domain') || '';
+  const urlPath = searchParams.get('path') || '/';
+
+  try {
+    // 1. Resolve domain → workspace
+    const { data: domainRow, error: domainError } = await db
+      .from('domains')
+      .select('workspace_id')
+      .eq('domain', domain)
+      .single();
+
+    if (domainError || !domainRow) {
+      return new NextResponse(notFoundHtml(domain), {
+        status: 404,
+        headers: { 'Content-Type': 'text/html' },
+      });
+    }
+
+    const workspaceId = domainRow.workspace_id;
+
+    // 2. Find active test matching this URL path
+    const { data: test, error: testError } = await db
+      .from('tests')
+      .select('*')
+      .eq('workspace_id', workspaceId)
+      .eq('status', 'active')
+      .eq('url_path', urlPath)
+      .single();
+
+    if (testError || !test) {
+      return new NextResponse(notFoundHtml(domain), {
+        status: 404,
+        headers: { 'Content-Type': 'text/html' },
+      });
+    }
+
+    // 3. Fetch variants
+    const { data: variants, error: variantsError } = await db
+      .from('test_variants')
+      .select('id, name, page_id, redirect_url, proxy_mode, traffic_weight, is_control, variant_type, hosted_url, pages(html_url, html_content)')
+      .eq('test_id', test.id)
+      .order('is_control', { ascending: false });
+
+    if (variantsError) {
+      console.error('[serve] variants query error:', variantsError.message, variantsError.code);
+    }
+
+    if (!variants || variants.length === 0) {
+      return new NextResponse(notFoundHtml(domain), {
+        status: 404,
+        headers: { 'Content-Type': 'text/html' },
+      });
+    }
+
+    // 4. Get or create session/visitor ID
+    const existingCookie = request.cookies.get(COOKIE_NAME)?.value;
+    const visitorId = existingCookie || crypto.randomUUID();
+
+    // 5. Check for sticky assignment cookie for this specific test
+    const stickyCookieName = `sl_test_${test.id}`;
+    const stickyVariantId = request.cookies.get(stickyCookieName)?.value;
+
+    let selectedVariant = variants.find((v) => v.id === stickyVariantId);
+
+    if (!selectedVariant) {
+      selectedVariant = await assignVariant(visitorId, test.id, variants as { id: string; traffic_weight: number }[]) as typeof variants[0];
+    }
+
+    // 6a. If variant has a redirect URL
+    if (selectedVariant.redirect_url) {
+      // Proxy mode: serve iframe wrapper so URL stays on custom domain
+      // The SPA runs in its original context inside the iframe
+      if (selectedVariant.proxy_mode !== false) {
+        // Fetch workspace scripts
+        const { data: proxyScripts } = await db
+          .from('scripts')
+          .select('*')
+          .eq('workspace_id', workspaceId)
+          .eq('is_active', true)
+          .is('page_id', null);
+
+        const headScriptTags: string[] = [];
+        const bodyEndScriptTags: string[] = [];
+        for (const script of proxyScripts || []) {
+          const tag = buildScriptTag(script.type, script.content);
+          if (script.placement === 'head') headScriptTags.push(tag);
+          else bodyEndScriptTags.push(tag);
+        }
+
+        // Fetch conversion goals and build tracking snippet
+        const { data: proxyGoals } = await db
+          .from('conversion_goals')
+          .select('*')
+          .eq('test_id', test.id);
+
+        const proxyTrackingSnippet = buildTrackingSnippet(
+          test.id, selectedVariant.id, visitorId, proxyGoals || [], APP_URL
+        );
+
+        const iframeUrl = selectedVariant.redirect_url;
+        const testHeadScripts = (test as { head_scripts?: string }).head_scripts || '';
+        const iframeHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Loading…</title>
+${testHeadScripts}
+${headScriptTags.join('\n')}
+<style>*{margin:0;padding:0}html,body{width:100%;height:100%;overflow:hidden}iframe{width:100%;height:100vh;border:none;display:block}</style>
+</head>
+<body>
+<iframe src="${iframeUrl}" allow="forms; scripts; same-origin" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"></iframe>
+${bodyEndScriptTags.join('\n')}
+${proxyTrackingSnippet}
+</body>
+</html>`;
+
+        // Record server-side pageview
+        await db.from('events').insert({
+          test_id: test.id,
+          variant_id: selectedVariant.id,
+          visitor_hash: visitorId,
+          type: 'pageview',
+          metadata: { redirect_url: selectedVariant.redirect_url, proxy: true },
+        });
+
+        const proxyResponse = new NextResponse(iframeHtml, {
+          status: 200,
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
+
+        const cookieOptions = { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax' as const, maxAge: 60 * 60 * 24 * 90, path: '/' };
+        if (!existingCookie) proxyResponse.cookies.set(COOKIE_NAME, visitorId, cookieOptions);
+        if (!stickyVariantId) proxyResponse.cookies.set(stickyCookieName, selectedVariant.id, cookieOptions);
+
+        return proxyResponse;
+      }
+
+      // Standard 302 redirect mode
+      const redirectUrl = new URL(selectedVariant.redirect_url);
+      redirectUrl.searchParams.set('sl_vid', selectedVariant.id);
+      const redirectResponse = NextResponse.redirect(redirectUrl.toString(), 302);
+
+      const cookieOptions = {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax' as const,
+        maxAge: 60 * 60 * 24 * 90,
+        path: '/',
+      };
+
+      if (!existingCookie) {
+        redirectResponse.cookies.set(COOKIE_NAME, visitorId, cookieOptions);
+      }
+      if (!stickyVariantId) {
+        redirectResponse.cookies.set(stickyCookieName, selectedVariant.id, cookieOptions);
+      }
+
+      await db.from('events').insert({
+        test_id: test.id,
+        variant_id: selectedVariant.id,
+        visitor_hash: visitorId,
+        type: 'pageview',
+        metadata: { redirect_url: selectedVariant.redirect_url },
+      });
+
+      return redirectResponse;
+    }
+
+    // 6b. Hosted AI variant — serve HTML directly with tracking injected
+    if (selectedVariant.variant_type === 'hosted') {
+      // Fetch variant_pages record for this variant
+      const { data: variantPage } = await db
+        .from('variant_pages')
+        .select('html_storage_path')
+        .eq('variant_id', selectedVariant.id)
+        .eq('status', 'ready')
+        .order('version', { ascending: false })
+        .limit(1)
+        .single();
+
+      if (variantPage) {
+        const { data: fileData } = await db.storage
+          .from('variants')
+          .download(variantPage.html_storage_path);
+
+        if (fileData) {
+          let hostedHtml = await fileData.text();
+
+          // Fetch workspace scripts
+          const { data: hostedScripts } = await db
+            .from('scripts')
+            .select('*')
+            .eq('workspace_id', workspaceId)
+            .eq('is_active', true)
+            .is('page_id', null);
+
+          const hostedHeadScripts: string[] = [];
+          const hostedBodyScripts: string[] = [];
+          for (const script of hostedScripts || []) {
+            const tag = buildScriptTag(script.type, script.content);
+            if (script.placement === 'head') hostedHeadScripts.push(tag);
+            else hostedBodyScripts.push(tag);
+          }
+
+          // Fetch conversion goals
+          const { data: hostedGoals } = await db
+            .from('conversion_goals')
+            .select('*')
+            .eq('test_id', test.id);
+
+          const hostedTracking = buildTrackingSnippet(
+            test.id, selectedVariant.id, visitorId, hostedGoals || [], APP_URL
+          );
+
+          hostedHtml = injectIntoHtml(hostedHtml, hostedHeadScripts, hostedBodyScripts, hostedTracking);
+
+          // Record pageview
+          await db.from('events').insert({
+            test_id: test.id,
+            variant_id: selectedVariant.id,
+            visitor_hash: visitorId,
+            type: 'pageview',
+            metadata: { variant_type: 'hosted' },
+          });
+
+          const hostedResponse = new NextResponse(hostedHtml, {
+            status: 200,
+            headers: {
+              'Content-Type': 'text/html; charset=utf-8',
+              'Cache-Control': 'public, max-age=300, s-maxage=300',
+            },
+          });
+
+          const hostedCookieOptions = { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax' as const, maxAge: 60 * 60 * 24 * 90, path: '/' };
+          if (!existingCookie) hostedResponse.cookies.set(COOKIE_NAME, visitorId, hostedCookieOptions);
+          if (!stickyVariantId) hostedResponse.cookies.set(stickyCookieName, selectedVariant.id, hostedCookieOptions);
+
+          return hostedResponse;
+        }
+      }
+      // Fall through to regular HTML serving if hosted page not found
+    }
+
+    // 6c. Fetch HTML for variant
+    let html = '';
+    const pageData = (selectedVariant.pages as unknown) as { html_url: string; html_content: string | null } | null;
+
+    if (pageData?.html_content) {
+      html = pageData.html_content;
+    } else if (pageData?.html_url) {
+      try {
+        html = await downloadHtml(pageData.html_url);
+      } catch {
+        html = '<html><body><p>Page content unavailable.</p></body></html>';
+      }
+    } else {
+      return new NextResponse(notFoundHtml(domain), {
+        status: 404,
+        headers: { 'Content-Type': 'text/html' },
+      });
+    }
+
+    // 7. Fetch workspace scripts
+    const { data: scripts } = await db
+      .from('scripts')
+      .select('*')
+      .eq('workspace_id', workspaceId)
+      .eq('is_active', true)
+      .is('page_id', null);
+
+    const headScripts: string[] = [];
+    const bodyEndScripts: string[] = [];
+
+    for (const script of scripts || []) {
+      const tag = buildScriptTag(script.type, script.content);
+      if (script.placement === 'head') {
+        headScripts.push(tag);
+      } else {
+        bodyEndScripts.push(tag);
+      }
+    }
+
+    // 8. Fetch conversion goals
+    const { data: goals } = await db
+      .from('conversion_goals')
+      .select('*')
+      .eq('test_id', test.id);
+
+    // 9. Build tracking snippet
+    const visitorHash = visitorId;
+    const trackingSnippet = buildTrackingSnippet(
+      test.id,
+      selectedVariant.id,
+      visitorHash,
+      goals || [],
+      APP_URL
+    );
+
+    // 10. Inject everything into HTML
+    const finalHtml = injectIntoHtml(html, headScripts, bodyEndScripts, trackingSnippet);
+
+    // 11. Build response with sticky cookies
+    const response = new NextResponse(finalHtml, {
+      status: 200,
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    });
+
+    const cookieOptions = {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax' as const,
+      maxAge: 60 * 60 * 24 * 90, // 90 days
+      path: '/',
+    };
+
+    if (!existingCookie) {
+      response.cookies.set(COOKIE_NAME, visitorId, cookieOptions);
+    }
+
+    if (!stickyVariantId) {
+      response.cookies.set(stickyCookieName, selectedVariant.id, cookieOptions);
+    }
+
+    return response;
+  } catch (err) {
+    console.error('[serve]', err);
+    return new NextResponse(errorHtml(), {
+      status: 500,
+      headers: { 'Content-Type': 'text/html' },
+    });
+  }
+}
+
+function notFoundHtml(domain: string) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Not Found</title>
+<style>body{font-family:sans-serif;background:#0f172a;color:#f8fafc;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.box{text-align:center}.code{font-size:4rem;font-weight:700;color:#3D8BDA}h1{margin:.5rem 0}p{color:#94a3b8}</style>
+</head>
+<body><div class="box"><div class="code">404</div><h1>Page Not Found</h1>
+<p>No active test found for <strong>${domain}</strong></p></div></body>
+</html>`;
+}
+
+function errorHtml() {
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Error</title>
+<style>body{font-family:sans-serif;background:#0f172a;color:#f8fafc;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.box{text-align:center}.code{font-size:4rem;font-weight:700;color:#ef4444}</style>
+</head>
+<body><div class="box"><div class="code">500</div><h1>Server Error</h1></div></body>
+</html>`;
+}
